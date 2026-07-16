@@ -7,6 +7,7 @@
 #
 # Output assets (version = tag without the leading "v"):
 #   codex-429-autoban_<version>_linux_amd64.zip      -> codex-429-autoban.so
+#   codex-429-autoban_<version>_linux_arm64.zip      -> codex-429-autoban.so
 #   codex-429-autoban_<version>_darwin_arm64.zip     -> codex-429-autoban.dylib
 #   codex-429-autoban_<version>_windows_amd64.zip    -> codex-429-autoban.dll
 #   checksums.txt
@@ -31,6 +32,10 @@ jobs:
           - goos: linux
             goarch: amd64
             runner: ubuntu-latest
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
             ext: so
           - goos: darwin
             goarch: arm64
