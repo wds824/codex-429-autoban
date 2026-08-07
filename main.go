@@ -278,8 +278,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             pluginName,
 			Version:          pluginVersion,
-			Author:           "ysxk",
-			GitHubRepository: "https://github.com/ysxk/codex-429-autoban",
+			Author:           "wds824",
+			GitHubRepository: "https://github.com/wds824/codex-429-autoban",
 			ConfigFields:     []pluginapi.ConfigField{},
 		},
 		Capabilities: registrationCapability{
