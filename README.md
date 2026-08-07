@@ -108,6 +108,7 @@ plugins:
       enabled: true
       priority: 100   # 数字越大越先执行；建议设高一点，让禁用判断先于其他调度插件
       discord_webhook_url: "https://discord.com/api/webhooks/<id>/<token>"
+      discord_mention: "<@USER_ID>"   # 可选：也可填写 <@&ROLE_ID>、@everyone 或 @here
       discord_notify_429: true
       discord_notify_pool: true
 ```
@@ -115,6 +116,7 @@ plugins:
 配置说明：
 
 - `discord_webhook_url`：Discord 频道的 Incoming Webhook URL；留空则关闭通知。
+- `discord_mention`：可选提醒对象，填写完整 Discord 提及格式，例如 `<@123456789012345678>` 或 `<@&123456789012345678>`；也支持 `@everyone`、`@here`。插件会自动设置 `allowed_mentions`，不会发送 `SUPPRESS_NOTIFICATIONS`。
 - `discord_notify_429`：是否发送新 429 排除通知，默认 `true`。同一个账号在同一段 ban 期间重复 429 不会重复刷屏。
 - `discord_notify_pool`：是否在通知中附带“可用 / 总数”号池统计，默认 `true`。
 

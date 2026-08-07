@@ -93,7 +93,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.3.1"
+	pluginVersion = "0.3.2"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -122,6 +122,7 @@ type lifecycleRequest struct {
 
 type pluginConfig struct {
 	DiscordWebhookURL string `yaml:"discord_webhook_url"`
+	DiscordMention    string `yaml:"discord_mention"`
 	DiscordNotify429  bool   `yaml:"discord_notify_429"`
 	DiscordNotifyPool bool   `yaml:"discord_notify_pool"`
 }
@@ -337,6 +338,11 @@ func pluginRegistration() registration {
 					Description: "Discord incoming webhook URL. Leave empty to disable Discord notifications.",
 				},
 				{
+					Name:        "discord_mention",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Optional Discord mention for alerts, e.g. <@USER_ID>, <@&ROLE_ID>, @everyone, or @here.",
+				},
+				{
 					Name:        "discord_notify_429",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
 					Description: "Send a Discord notification when a Codex account is newly excluded after a 429.",
@@ -377,11 +383,15 @@ func configurePlugin(raw []byte) error {
 		}
 	}
 	cfg.DiscordWebhookURL = strings.TrimSpace(cfg.DiscordWebhookURL)
+	cfg.DiscordMention = strings.TrimSpace(cfg.DiscordMention)
 	if cfg.DiscordWebhookURL != "" {
 		parsed, errParse := url.Parse(cfg.DiscordWebhookURL)
 		if errParse != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return fmt.Errorf("discord_webhook_url must be an http(s) URL")
 		}
+	}
+	if _, _, errMention := discordMentionParts(cfg.DiscordMention); errMention != nil {
+		return errMention
 	}
 	runtimeConfigState.mu.Lock()
 	runtimeConfigState.cfg = cfg
@@ -533,6 +543,10 @@ func sendDiscord429Notification(record pluginapi.UsageRecord, entry banEntry) {
 			Footer:    discordFooter{Text: pluginName + " v" + pluginVersion},
 		}},
 	}
+	if errMention := addDiscordMention(&payload, cfg.DiscordMention); errMention != nil {
+		slog.Warn("codex-429-autoban: invalid Discord mention, skipping webhook notification", "error", errMention)
+		return
+	}
 	raw, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
 		slog.Warn("codex-429-autoban: failed to encode Discord webhook payload", "error", errMarshal)
@@ -546,8 +560,16 @@ func sendDiscord429Notification(record pluginapi.UsageRecord, entry banEntry) {
 }
 
 type discordWebhookPayload struct {
-	Username string         `json:"username,omitempty"`
-	Embeds   []discordEmbed `json:"embeds,omitempty"`
+	Username         string                  `json:"username,omitempty"`
+	Content          string                  `json:"content,omitempty"`
+	AllowedMentions  *discordAllowedMentions `json:"allowed_mentions,omitempty"`
+	Embeds           []discordEmbed          `json:"embeds,omitempty"`
+}
+
+type discordAllowedMentions struct {
+	Parse  []string `json:"parse"`
+	Users  []string `json:"users,omitempty"`
+	Roles  []string `json:"roles,omitempty"`
 }
 
 type discordEmbed struct {
@@ -570,6 +592,57 @@ type discordFooter struct {
 
 func discordCode(value string) string {
 	return "`" + strings.ReplaceAll(strings.TrimSpace(value), "`", "'") + "`"
+}
+
+func addDiscordMention(payload *discordWebhookPayload, raw string) error {
+	mention, allowed, errMention := discordMentionParts(raw)
+	if errMention != nil {
+		return errMention
+	}
+	if mention == "" {
+		return nil
+	}
+	payload.Content = mention + " Codex 429 告警"
+	payload.AllowedMentions = allowed
+	return nil
+}
+
+func discordMentionParts(raw string) (string, *discordAllowedMentions, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, nil
+	}
+	if raw == "@everyone" || raw == "@here" {
+		return raw, &discordAllowedMentions{Parse: []string{"everyone"}}, nil
+	}
+	if strings.HasPrefix(raw, "<@&") && strings.HasSuffix(raw, ">") {
+		id := strings.TrimSuffix(strings.TrimPrefix(raw, "<@&"), ">")
+		if isDiscordSnowflake(id) {
+			return raw, &discordAllowedMentions{Parse: []string{}, Roles: []string{id}}, nil
+		}
+		return "", nil, fmt.Errorf("discord_mention has invalid role mention %q", raw)
+	}
+	if strings.HasPrefix(raw, "<@") && strings.HasSuffix(raw, ">") {
+		id := strings.TrimSuffix(strings.TrimPrefix(raw, "<@"), ">")
+		id = strings.TrimPrefix(id, "!")
+		if isDiscordSnowflake(id) {
+			return raw, &discordAllowedMentions{Parse: []string{}, Users: []string{id}}, nil
+		}
+		return "", nil, fmt.Errorf("discord_mention has invalid user mention %q", raw)
+	}
+	return "", nil, fmt.Errorf("discord_mention must be <@USER_ID>, <@&ROLE_ID>, @everyone, or @here")
+}
+
+func isDiscordSnowflake(value string) bool {
+	if value == "" || len(value) > 25 {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func postDiscordWebhook(webhookURL string, payload []byte) error {
@@ -1154,6 +1227,12 @@ func handleManagementTestWebhook() pluginapi.ManagementResponse {
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Footer:    discordFooter{Text: pluginName + " v" + pluginVersion},
 		}},
+	}
+	if errMention := addDiscordMention(&payload, cfg.DiscordMention); errMention != nil {
+		return jsonManagementResponse(http.StatusInternalServerError, map[string]any{
+			"error":   "invalid_discord_mention",
+			"message": errMention.Error(),
+		})
 	}
 	raw, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
