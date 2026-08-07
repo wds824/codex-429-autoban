@@ -12,8 +12,9 @@
    - 两个都满 → 按较晚的（周）解禁
 3. **自动解禁**：之后每次 CPA 选凭证时，插件把"还没到解禁时间"的凭证从候选里剔除；一旦过了刷新时间，自动放回候选。
 4. **手动加回号池**：如果你在 Codex 侧手动重置额度或使用了重置卡，可以通过插件的 Management API / 资源页立即解除插件内存里的 ban，不必等原来的 `reset-at`。
-5. **Discord 通知**：配置 Discord Incoming Webhook 后，新账号因 429 被排除时会发送账号、窗口、解除时间和 Codex 号池可用/总数。
-6. **只管 codex**：非 codex 凭证一律不干预，交给 CPA 原有逻辑。
+5. **读取 CPA 实际冷却**：管理页通过 CPA 的 `host.auth.list` 读取账号当前 `next_retry_after`，同时显示插件解除时间、CPA 下次重试时间，并按两者较晚值给出预计实际回池时间。
+6. **Discord 通知**：配置 Discord Incoming Webhook 后，新账号因 429 被排除时会发送账号、窗口、解除时间和 Codex 号池可用/总数。
+7. **只管 codex**：非 codex 凭证一律不干预，交给 CPA 原有逻辑。
 
 ## 怎么判断 5 小时还是周限额
 
@@ -31,6 +32,16 @@ OpenAI 的 ChatGPT/Codex 后端在 429 时会返回一组自定义头（不是�
 **判断逻辑**：哪个窗口的 `used-percent` 到了 100，就用那个窗口的 `reset-at` 作为解禁时间。月重置账号如果只返回一个主窗口，则直接使用该窗口的 `reset-at`，不再强制按 5 小时处理。
 
 > 如果 429 响应里没有这些头（少数情况，比如来自中间代理的伪 429），插件保守地按 5 小时禁用（这是更常见的情形）。
+
+## CPA 实际回池时间从哪里读取
+
+状态页请求 `/v0/management/plugins/codex-429-autoban/bans` 时，插件调用 CPA 的 `host.auth.list` 回调。CPA 会从运行中的 `AuthManager` 构造每个账号的状态，其中：
+
+- `next_retry_after` 是 CPA 当前记录的下次重试时间；
+- `unavailable`、`status`、`status_message` 用来说明账号当前是否仍被 CPA 冷却；
+- 如果 CPA 没有返回明确时间，页面会显示“CPA 当前无明确回池时间”，不会把插件的时间冒充成 CPA 的精确时间。
+
+“预计实际回池时间”取插件 `reset-at` 与 CPA `next_retry_after` 中较晚的一个。因为两边是独立状态，只有两者都到期后账号才适合再次使用。
 
 ## 为什么解禁不需要定时器
 

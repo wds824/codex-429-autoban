@@ -93,7 +93,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.3.1"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -467,6 +467,27 @@ type hostAuthListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
 }
 
+func hostAuthEntries() ([]pluginapi.HostAuthFileEntry, error) {
+	raw, errHost := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	if errHost != nil {
+		return nil, errHost
+	}
+	var response hostAuthListResponse
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host.auth.list result: %w", errUnmarshal)
+	}
+	return response.Files, nil
+}
+
+func findHostAuthEntry(entries []pluginapi.HostAuthFileEntry, authID string) (pluginapi.HostAuthFileEntry, bool) {
+	for _, auth := range entries {
+		if authIDMatches(authID, auth.ID, auth.AuthIndex, auth.Name, auth.Path) {
+			return auth, true
+		}
+	}
+	return pluginapi.HostAuthFileEntry{}, false
+}
+
 type poolStats struct {
 	Available    int
 	Total        int
@@ -587,18 +608,14 @@ func currentCodexPoolStats(recentAuthID string) poolStats {
 }
 
 func hostCodexPoolStats(recentAuthID string) (poolStats, error) {
-	raw, errHost := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	entries, errHost := hostAuthEntries()
 	if errHost != nil {
 		return poolStats{}, errHost
-	}
-	var response hostAuthListResponse
-	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
-		return poolStats{}, fmt.Errorf("decode host.auth.list result: %w", errUnmarshal)
 	}
 
 	now := time.Now()
 	stats := poolStats{Known: true, CandidateIDs: make(map[string]struct{})}
-	for _, auth := range response.Files {
+	for _, auth := range entries {
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), providerCodex) {
 			continue
 		}
@@ -951,38 +968,89 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 }
 
 type managementBanStatus struct {
-	Plugin  string              `json:"plugin"`
-	Version string              `json:"version"`
-	Count   int                 `json:"count"`
-	Bans    []managementBanInfo `json:"bans"`
+	Plugin              string              `json:"plugin"`
+	Version             string              `json:"version"`
+	Count               int                 `json:"count"`
+	CPAAuthListAvailable bool                `json:"cpa_auth_list_available"`
+	CPAAuthListError     string              `json:"cpa_auth_list_error,omitempty"`
+	Bans                []managementBanInfo `json:"bans"`
 }
 
 type managementBanInfo struct {
-	AuthID           string `json:"auth_id"`
-	Window           string `json:"window"`
-	BannedAt         string `json:"banned_at,omitempty"`
-	BannedAtUnix     int64  `json:"banned_at_unix,omitempty"`
-	ResetAt          string `json:"reset_at"`
-	ResetAtUnix      int64  `json:"reset_at_unix"`
-	RemainingSeconds int64  `json:"remaining_seconds"`
+	AuthID                    string `json:"auth_id"`
+	Window                    string `json:"window"`
+	BannedAt                  string `json:"banned_at,omitempty"`
+	BannedAtUnix               int64  `json:"banned_at_unix,omitempty"`
+	ResetAt                   string `json:"reset_at"`
+	ResetAtUnix               int64  `json:"reset_at_unix"`
+	RemainingSeconds          int64  `json:"remaining_seconds"`
+	CPAAuthFound              bool   `json:"cpa_auth_found"`
+	CPANextRetryAfter         string `json:"cpa_next_retry_after,omitempty"`
+	CPANextRetryAfterUnix     int64  `json:"cpa_next_retry_after_unix,omitempty"`
+	CPAStatus                 string `json:"cpa_status,omitempty"`
+	CPAStatusMessage          string `json:"cpa_status_message,omitempty"`
+	CPAUnavailable             bool   `json:"cpa_unavailable,omitempty"`
+	EffectiveResetAt          string `json:"effective_reset_at"`
+	EffectiveResetAtUnix      int64  `json:"effective_reset_at_unix"`
+	EffectiveRemainingSeconds int64  `json:"effective_remaining_seconds"`
+	EffectiveResetSource      string `json:"effective_reset_source"`
 }
 
 func currentBanStatus() managementBanStatus {
 	now := time.Now()
 	banStore.clearExpired(now)
 	snapshot := banStore.snapshot()
+	entries, errHost := hostAuthEntries()
+	status := managementBanStatus{
+		Plugin:               pluginName,
+		Version:              pluginVersion,
+		CPAAuthListAvailable: errHost == nil,
+	}
+	if errHost != nil {
+		status.CPAAuthListError = errHost.Error()
+		slog.Debug("codex-429-autoban: unable to read CPA auth list for management status", "error", errHost)
+	}
 	bans := make([]managementBanInfo, 0, len(snapshot))
 	for authID, entry := range snapshot {
-		remaining := int64(0)
-		if now.Before(entry.ResetAt) {
-			remaining = int64(entry.ResetAt.Sub(now).Seconds())
+		cpaAuth, cpaFound := findHostAuthEntry(entries, authID)
+		effectiveResetAt := entry.ResetAt
+		effectiveResetSource := "plugin"
+		if cpaFound && !cpaAuth.NextRetryAfter.IsZero() {
+			if cpaAuth.NextRetryAfter.After(effectiveResetAt) {
+				effectiveResetAt = cpaAuth.NextRetryAfter
+				effectiveResetSource = "cpa"
+			} else {
+				effectiveResetSource = "plugin_and_cpa"
+			}
+		} else if cpaFound && cpaAuth.Unavailable {
+			// CPA reports this auth as unavailable but did not provide a
+			// timestamp. The plugin reset remains the lower bound only;
+			// the actual CPA return time is unknown.
+			effectiveResetSource = "unknown"
 		}
+
+		remaining := remainingSeconds(now, entry.ResetAt)
+		effectiveRemaining := remainingSeconds(now, effectiveResetAt)
 		info := managementBanInfo{
-			AuthID:           authID,
-			Window:           entry.Window,
-			ResetAt:          entry.ResetAt.Format(time.RFC3339),
-			ResetAtUnix:      entry.ResetAt.Unix(),
-			RemainingSeconds: remaining,
+			AuthID:                    authID,
+			Window:                    entry.Window,
+			ResetAt:                   entry.ResetAt.Format(time.RFC3339),
+			ResetAtUnix:               entry.ResetAt.Unix(),
+			RemainingSeconds:          remaining,
+			CPAAuthFound:              cpaFound,
+			EffectiveResetAt:          effectiveResetAt.Format(time.RFC3339),
+			EffectiveResetAtUnix:      effectiveResetAt.Unix(),
+			EffectiveRemainingSeconds: effectiveRemaining,
+			EffectiveResetSource:      effectiveResetSource,
+		}
+		if cpaFound {
+			info.CPAStatus = cpaAuth.Status
+			info.CPAStatusMessage = cpaAuth.StatusMessage
+			info.CPAUnavailable = cpaAuth.Unavailable
+			if !cpaAuth.NextRetryAfter.IsZero() {
+				info.CPANextRetryAfter = cpaAuth.NextRetryAfter.Format(time.RFC3339)
+				info.CPANextRetryAfterUnix = cpaAuth.NextRetryAfter.Unix()
+			}
 		}
 		if !entry.BannedAt.IsZero() {
 			info.BannedAt = entry.BannedAt.Format(time.RFC3339)
@@ -996,12 +1064,16 @@ func currentBanStatus() managementBanStatus {
 		}
 		return bans[i].ResetAtUnix < bans[j].ResetAtUnix
 	})
-	return managementBanStatus{
-		Plugin:  pluginName,
-		Version: pluginVersion,
-		Count:   len(bans),
-		Bans:    bans,
+	status.Count = len(bans)
+	status.Bans = bans
+	return status
+}
+
+func remainingSeconds(now, target time.Time) int64 {
+	if target.IsZero() || !now.Before(target) {
+		return 0
 	}
+	return int64(target.Sub(now).Seconds())
 }
 
 type managementUnbanRequest struct {
@@ -1250,15 +1322,50 @@ POST /v0/management/plugins/codex-429-autoban/test-webhook</pre>
       return m + "m";
     }
 
+    function formatCpaRetryAt(ban) {
+      if (!ban.cpa_auth_found) {
+        return "未找到 CPA 账号";
+      }
+      if (ban.cpa_next_retry_after) {
+        return escapeHtml(ban.cpa_next_retry_after);
+      }
+      if (ban.cpa_unavailable) {
+        return "CPA 当前无明确回池时间";
+      }
+      return "CPA 当前未设置冷却时间";
+    }
+
+    function formatEffectiveResetAt(ban) {
+      if (ban.effective_reset_source === "unknown") {
+        return "未知（CPA 未提供时间）";
+      }
+      const source = ban.effective_reset_source === "cpa" ? "CPA" :
+        (ban.effective_reset_source === "plugin_and_cpa" ? "插件/CPA" : "插件");
+      return escapeHtml(ban.effective_reset_at) + "（" + source + "）";
+    }
+
+    function formatEffectiveRemaining(ban) {
+      if (ban.effective_reset_source === "unknown") {
+        return "未知";
+      }
+      return formatRemaining(ban.effective_remaining_seconds);
+    }
+
     function render(data) {
       const list = document.getElementById("list");
       if (!data.bans || data.bans.length === 0) {
         list.innerHTML = "<p>没有账号被插件 ban，号池无需手动恢复。</p>";
         return;
       }
-      let html = "<table><thead><tr><th>Auth ID</th><th>窗口</th><th>解除时间</th><th>剩余</th><th>操作</th></tr></thead><tbody>";
+      let html = "";
+      if (!data.cpa_auth_list_available) {
+        html += "<p class=\"muted\">CPA auth 列表读取失败，以下仅显示插件记录的时间。</p>";
+      }
+      html += "<table><thead><tr><th>Auth ID</th><th>窗口</th><th>插件解除时间</th><th>CPA 下次重试时间</th><th>预计实际回池时间</th><th>剩余</th><th>操作</th></tr></thead><tbody>";
       for (const ban of data.bans) {
-        html += "<tr><td><code>" + escapeHtml(ban.auth_id) + "</code></td><td>" + escapeHtml(ban.window) + "</td><td>" + escapeHtml(ban.reset_at) + "</td><td>" + formatRemaining(ban.remaining_seconds) + "</td><td><button onclick=\"unban('" + escapeJs(ban.auth_id) + "')\">加回号池</button></td></tr>";
+        const cpaStatus = ban.cpa_status_message || ban.cpa_status || "";
+        const cpaStatusTitle = cpaStatus ? " title=\"" + escapeHtml(cpaStatus) + "\"" : "";
+        html += "<tr><td><code>" + escapeHtml(ban.auth_id) + "</code></td><td>" + escapeHtml(ban.window) + "</td><td>" + escapeHtml(ban.reset_at) + "</td><td" + cpaStatusTitle + ">" + formatCpaRetryAt(ban) + "</td><td>" + formatEffectiveResetAt(ban) + "</td><td>" + formatEffectiveRemaining(ban) + "</td><td><button onclick=\"unban('" + escapeJs(ban.auth_id) + "')\">加回号池</button></td></tr>";
       }
       html += "</tbody></table>";
       list.innerHTML = html;
