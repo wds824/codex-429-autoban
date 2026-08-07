@@ -68,7 +68,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.2.2"
+	pluginVersion = "0.2.3"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -79,8 +79,9 @@ const (
 	// Codex rate-limit window sizes, in minutes, as reported by the
 	// x-codex-primary-window-minutes / x-codex-secondary-window-minutes
 	// response headers.
-	windowMinutes5h   = 300   // 5 hours
-	windowMinutesWeek = 10080 // 7 days
+	windowMinutes5h       = 300   // 5 hours
+	windowMinutesWeek     = 10080 // 7 days
+	windowMinutesMonthMin = 40320 // 4 weeks; month-sized windows may be 28-31 days
 
 	// usedPercentThreshold is the "this window is the one that tripped" marker.
 	// A 429 carries the window that exhausted at ~100% used.
@@ -105,7 +106,7 @@ type banEntry struct {
 	// ResetAt is the upstream-reported time at which the exhausted window
 	// refreshes. The credential is skipped until now >= ResetAt.
 	ResetAt time.Time
-	// Window is a human-readable label of which limit was hit ("5h" or "week").
+	// Window is a human-readable label of which limit was hit ("5h", "week", or "month").
 	Window string
 	// BannedAt is when the ban was recorded, for logging only.
 	BannedAt time.Time
@@ -346,8 +347,8 @@ func handleUsage(raw []byte) ([]byte, error) {
 // or inconclusive.
 //
 // Header reference (ChatGPT/Codex backend, not the public Platform API):
-//   - x-codex-primary-window-minutes   = 300 for the 5-hour window
-//   - x-codex-primary-reset-at         = Unix seconds, 5-hour window reset
+//   - x-codex-primary-window-minutes   = 300 for 5h, ~43200 for a 30-day window
+//   - x-codex-primary-reset-at         = Unix seconds, primary window reset
 //   - x-codex-primary-used-percent     = 0-100
 //   - x-codex-secondary-window-minutes = 10080 for the weekly window
 //   - x-codex-secondary-reset-at       = Unix seconds, weekly window reset
@@ -357,6 +358,7 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 
 	primaryUsed := headerFloat(h, "x-codex-primary-used-percent")
 	secondaryUsed := headerFloat(h, "x-codex-secondary-used-percent")
+	primaryWindowMinutes := headerInt(h, "x-codex-primary-window-minutes")
 	primaryReset := headerUnixTime(h, "x-codex-primary-reset-at")
 	secondaryReset := headerUnixTime(h, "x-codex-secondary-reset-at")
 
@@ -373,7 +375,7 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 		}
 	case primaryFull && !secondaryFull:
 		if !primaryReset.IsZero() {
-			return banEntry{ResetAt: primaryReset, Window: "5h"}, true
+			return banEntry{ResetAt: primaryReset, Window: primaryWindowLabel(primaryWindowMinutes, secondaryReset.IsZero())}, true
 		}
 	case primaryFull && secondaryFull:
 		// Both exhausted: must wait for the later reset (weekly) to be safe.
@@ -381,12 +383,19 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 			return banEntry{ResetAt: secondaryReset, Window: "week (both full)"}, true
 		}
 		if !primaryReset.IsZero() {
-			return banEntry{ResetAt: primaryReset, Window: "5h (both full, weekly reset missing)"}, true
+			return banEntry{ResetAt: primaryReset, Window: primaryWindowLabel(primaryWindowMinutes, false) + " (both full, secondary reset missing)"}, true
 		}
 	default:
-		// Neither reports as full via used-percent. Fall back to window-minutes
-		// identity if a reset time is present, else give up.
-		if !primaryReset.IsZero() && headerInt(h, "x-codex-primary-window-minutes") == windowMinutes5h {
+		// A monthly account can expose only one window. When there is no usable
+		// secondary reset time, the primary reset-at is authoritative regardless
+		// of used-percent; use it to return the credential to the pool.
+		if !primaryReset.IsZero() && secondaryReset.IsZero() {
+			return banEntry{ResetAt: primaryReset, Window: primaryWindowLabel(primaryWindowMinutes, true)}, true
+		}
+
+		// With two windows present, use the known window size when the usage
+		// percentages are not decisive.
+		if !primaryReset.IsZero() && primaryWindowMinutes == windowMinutes5h {
 			return banEntry{ResetAt: primaryReset, Window: "5h"}, true
 		}
 		if !secondaryReset.IsZero() && headerInt(h, "x-codex-secondary-window-minutes") == windowMinutesWeek {
@@ -394,6 +403,29 @@ func classifyAndBuildBan(headers http.Header) (banEntry, bool) {
 		}
 	}
 	return banEntry{}, false
+}
+
+// primaryWindowLabel identifies the primary window. A primary-only response is
+// the monthly-account shape: its reset timestamp is authoritative and is
+// presented as month even if the provider's window-minutes field is absent or
+// still carries the default primary value. For explicit durations, four weeks
+// is the lower bound used for the month label.
+func primaryWindowLabel(windowMinutes int, singleWindow bool) string {
+	if singleWindow {
+		return "month"
+	}
+	switch {
+	case windowMinutes == windowMinutes5h:
+		return "5h"
+	case windowMinutes == windowMinutesWeek:
+		return "week"
+	case windowMinutes >= windowMinutesMonthMin:
+		return "month"
+	case windowMinutes > 0:
+		return "primary (" + strconv.Itoa(windowMinutes) + "m)"
+	default:
+		return "single window"
+	}
 }
 
 // handleSchedulerPick filters out credentials that are still banned, then

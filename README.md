@@ -8,6 +8,7 @@
 2. **判断禁多久**：读上游 OpenAI 返回的 `x-codex-*` 响应头，判断是 **5 小时窗口**被打满，还是 **周限额**被打满，并取对应窗口的刷新时间作为解禁时间。
    - 5 小时窗口满了 → 5 小时刷新后解禁
    - 周窗口满了 → 下周刷新时才解禁
+   - 月窗口（通常只有一个窗口）满了 → 按该窗口返回的 `reset-at` 解禁
    - 两个都满 → 按较晚的（周）解禁
 3. **自动解禁**：之后每次 CPA 选凭证时，插件把"还没到解禁时间"的凭证从候选里剔除；一旦过了刷新时间，自动放回候选。
 4. **手动加回号池**：如果你在 Codex 侧手动重置额度或使用了重置卡，可以通过插件的 Management API / 资源页立即解除插件内存里的 ban，不必等原来的 `reset-at`。
@@ -19,14 +20,14 @@ OpenAI 的 ChatGPT/Codex 后端在 429 时会返回一组自定义头（不是�
 
 | 响应头 | 含义 |
 |---|---|
-| `x-codex-primary-window-minutes` | `300` = 5 小时窗口 |
-| `x-codex-primary-reset-at` | 5 小时窗口刷新时间（Unix 秒） |
+| `x-codex-primary-window-minutes` | `300` = 5 小时；约 `43200` = 30 天月窗口 |
+| `x-codex-primary-reset-at` | 主窗口刷新时间（Unix 秒） |
 | `x-codex-primary-used-percent` | 5 小时窗口使用率（打满时 = 100） |
 | `x-codex-secondary-window-minutes` | `10080` = 7 天（周）窗口 |
 | `x-codex-secondary-reset-at` | 周窗口刷新时间（Unix 秒） |
 | `x-codex-secondary-used-percent` | 周窗口使用率 |
 
-**判断逻辑**：哪个窗口的 `used-percent` 到了 100，就用那个窗口的 `reset-at` 作为解禁时间。
+**判断逻辑**：哪个窗口的 `used-percent` 到了 100，就用那个窗口的 `reset-at` 作为解禁时间。月重置账号如果只返回一个主窗口，则直接使用该窗口的 `reset-at`，不再强制按 5 小时处理。
 
 > 如果 429 响应里没有这些头（少数情况，比如来自中间代理的伪 429），插件保守地按 5 小时禁用（这是更常见的情形）。
 
@@ -135,7 +136,7 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   │
   ├─ 不是 codex / 不是 429 → 跳过
   └─ 是 codex 且 429
-        ├─ 读 x-codex-* 头，判断 5h 还是周限额
+        ├─ 读 x-codex-* 头，判断 5h、周限额还是月限额
         └─ 记录：该凭证"到 X 时间才能再用"
 
 下次有请求来选凭证 → scheduler.pick（插件介入）
