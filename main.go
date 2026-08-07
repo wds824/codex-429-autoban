@@ -26,11 +26,14 @@ typedef struct {
 	size_t len;
 } cliproxy_buffer;
 
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+
 typedef struct {
 	uint32_t abi_version;
 	void* host_ctx;
-	void* call;
-	void* free_buffer;
+	cliproxy_host_call_fn call;
+	cliproxy_host_free_fn free_buffer;
 } cliproxy_host_api;
 
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
@@ -47,14 +50,35 @@ typedef struct {
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
+
+static const cliproxy_host_api* stored_host;
+
+static void store_host_api(const cliproxy_host_api* host) {
+	stored_host = host;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (stored_host == NULL || stored_host->call == NULL) {
+		return 1;
+	}
+	return stored_host->call(stored_host->host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host != NULL && stored_host->free_buffer != NULL && ptr != NULL) {
+		stored_host->free_buffer(ptr, len);
+	}
+}
 */
 import "C"
 
 import (
 	"encoding/json"
+	"fmt"
 	"html"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,11 +88,12 @@ import (
 
 	"codex-429-autoban/cpasdk/pluginabi"
 	"codex-429-autoban/cpasdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.2.3"
+	pluginVersion = "0.3.0"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -88,7 +113,26 @@ const (
 	usedPercentThreshold = 100
 
 	managementRoutePrefix = "/plugins/" + pluginName
+	discordWebhookTitle   = "Codex 429 Autoban"
 )
+
+type lifecycleRequest struct {
+	ConfigYAML []byte `json:"config_yaml"`
+}
+
+type pluginConfig struct {
+	DiscordWebhookURL string `yaml:"discord_webhook_url"`
+	DiscordNotify429  bool   `yaml:"discord_notify_429"`
+	DiscordNotifyPool bool   `yaml:"discord_notify_pool"`
+}
+
+type configState struct {
+	mu         sync.RWMutex
+	cfg        pluginConfig
+	configured bool
+}
+
+var runtimeConfigState configState
 
 // banStore holds, per credential, the time at which it may be used again.
 // A credential is absent from the map when it is not currently banned.
@@ -206,10 +250,11 @@ func main() {}
 // function pointers.
 //
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	C.store_host_api(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -250,12 +295,17 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	C.store_host_api(nil)
+}
 
 // handleMethod routes a CPA method to its handler.
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		if errConfigure := configurePlugin(request); errConfigure != nil {
+			return nil, errConfigure
+		}
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
@@ -280,7 +330,23 @@ func pluginRegistration() registration {
 			Version:          pluginVersion,
 			Author:           "wds824",
 			GitHubRepository: "https://github.com/wds824/codex-429-autoban",
-			ConfigFields:     []pluginapi.ConfigField{},
+			ConfigFields: []pluginapi.ConfigField{
+				{
+					Name:        "discord_webhook_url",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Discord incoming webhook URL. Leave empty to disable Discord notifications.",
+				},
+				{
+					Name:        "discord_notify_429",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Send a Discord notification when a Codex account is newly excluded after a 429.",
+				},
+				{
+					Name:        "discord_notify_pool",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Include current Codex available/total pool counts in Discord notifications.",
+				},
+			},
 		},
 		Capabilities: registrationCapability{
 			UsagePlugin:   true,
@@ -288,6 +354,57 @@ func pluginRegistration() registration {
 			ManagementAPI: true,
 		},
 	}
+}
+
+func defaultPluginConfig() pluginConfig {
+	return pluginConfig{
+		DiscordNotify429:  true,
+		DiscordNotifyPool: true,
+	}
+}
+
+func configurePlugin(raw []byte) error {
+	cfg := defaultPluginConfig()
+	if len(raw) > 0 {
+		var req lifecycleRequest
+		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+			return fmt.Errorf("decode plugin lifecycle request: %w", errUnmarshal)
+		}
+		if len(req.ConfigYAML) > 0 {
+			if errDecode := yaml.Unmarshal(req.ConfigYAML, &cfg); errDecode != nil {
+				return fmt.Errorf("decode plugin config: %w", errDecode)
+			}
+		}
+	}
+	cfg.DiscordWebhookURL = strings.TrimSpace(cfg.DiscordWebhookURL)
+	if cfg.DiscordWebhookURL != "" {
+		parsed, errParse := url.Parse(cfg.DiscordWebhookURL)
+		if errParse != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("discord_webhook_url must be an http(s) URL")
+		}
+	}
+	runtimeConfigState.mu.Lock()
+	runtimeConfigState.cfg = cfg
+	runtimeConfigState.configured = true
+	runtimeConfigState.mu.Unlock()
+	if cfg.DiscordWebhookURL == "" {
+		slog.Info("codex-429-autoban: Discord webhook notifications disabled")
+	} else {
+		slog.Info("codex-429-autoban: Discord webhook notifications configured",
+			"notify_429", cfg.DiscordNotify429, "notify_pool", cfg.DiscordNotifyPool)
+	}
+	return nil
+}
+
+func configuredPlugin() pluginConfig {
+	runtimeConfigState.mu.RLock()
+	cfg := runtimeConfigState.cfg
+	configured := runtimeConfigState.configured
+	runtimeConfigState.mu.RUnlock()
+	if !configured {
+		return defaultPluginConfig()
+	}
+	return cfg
 }
 
 // handleUsage observes a completed request. On a Codex 429 it records the
@@ -316,12 +433,14 @@ func handleUsage(raw []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
+	now := time.Now()
+	previous, hadPrevious := banStore.lookup(authID)
+	wasActive := hadPrevious && now.Before(previous.ResetAt)
 	entry, ok := classifyAndBuildBan(record.ResponseHeaders)
 	if !ok {
 		// Could not determine which window was hit from the headers.
 		// Fall back to a conservative 5-hour ban so the credential is not
 		// hammered while rate-limited, matching the more common case.
-		now := time.Now()
 		entry = banEntry{
 			ResetAt:  now.Add(5 * time.Hour),
 			Window:   "5h (fallback, headers missing)",
@@ -330,7 +449,7 @@ func handleUsage(raw []byte) ([]byte, error) {
 		slog.Warn("codex-429-autoban: x-codex-* headers missing on 429, falling back to 5h ban",
 			"auth_id", authID)
 	} else {
-		entry.BannedAt = time.Now()
+		entry.BannedAt = now
 	}
 
 	banStore.set(authID, entry)
@@ -338,7 +457,262 @@ func handleUsage(raw []byte) ([]byte, error) {
 		"auth_id", authID,
 		"window", entry.Window,
 		"reset_at", entry.ResetAt.Format(time.RFC3339))
+	if !wasActive {
+		sendDiscord429Notification(record, entry)
+	}
 	return okEnvelope(map[string]any{})
+}
+
+type hostAuthListResponse struct {
+	Files []pluginapi.HostAuthFileEntry `json:"files"`
+}
+
+type poolStats struct {
+	Available    int
+	Total        int
+	Known        bool
+	CandidateIDs map[string]struct{}
+}
+
+type poolStatsState struct {
+	mu    sync.RWMutex
+	stats poolStats
+}
+
+var latestPoolStats poolStatsState
+
+func sendDiscord429Notification(record pluginapi.UsageRecord, entry banEntry) {
+	cfg := configuredPlugin()
+	if cfg.DiscordWebhookURL == "" || !cfg.DiscordNotify429 {
+		return
+	}
+
+	stats := currentCodexPoolStats(record.AuthID)
+	poolText := "未知"
+	if stats.Known {
+		poolText = fmt.Sprintf("%d / %d", stats.Available, stats.Total)
+	}
+	resetUnix := entry.ResetAt.Unix()
+	resetText := entry.ResetAt.Format(time.RFC3339) + " (<t:" + strconv.FormatInt(resetUnix, 10) + ":R>)"
+	fields := []discordField{
+		{Name: "账号", Value: discordCode(record.AuthID), Inline: false},
+		{Name: "窗口", Value: entry.Window, Inline: true},
+		{Name: "解除时间", Value: resetText, Inline: true},
+	}
+	if cfg.DiscordNotifyPool {
+		fields = append(fields, discordField{Name: "Codex 号池可用 / 总数", Value: poolText, Inline: true})
+	}
+	payload := discordWebhookPayload{
+		Username: discordWebhookTitle,
+		Embeds: []discordEmbed{{
+			Title:     "Codex 账号已因 429 移出号池",
+			Color:     15158332,
+			Fields:    fields,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Footer:    discordFooter{Text: pluginName + " v" + pluginVersion},
+		}},
+	}
+	raw, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		slog.Warn("codex-429-autoban: failed to encode Discord webhook payload", "error", errMarshal)
+		return
+	}
+	go func() {
+		if errPost := postDiscordWebhook(cfg.DiscordWebhookURL, raw); errPost != nil {
+			slog.Warn("codex-429-autoban: Discord webhook request failed", "error", errPost)
+		}
+	}()
+}
+
+type discordWebhookPayload struct {
+	Username string         `json:"username,omitempty"`
+	Embeds   []discordEmbed `json:"embeds,omitempty"`
+}
+
+type discordEmbed struct {
+	Title     string         `json:"title,omitempty"`
+	Color     int            `json:"color,omitempty"`
+	Fields    []discordField `json:"fields,omitempty"`
+	Timestamp string         `json:"timestamp,omitempty"`
+	Footer    discordFooter  `json:"footer,omitempty"`
+}
+
+type discordField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline,omitempty"`
+}
+
+type discordFooter struct {
+	Text string `json:"text,omitempty"`
+}
+
+func discordCode(value string) string {
+	return "`" + strings.ReplaceAll(strings.TrimSpace(value), "`", "'") + "`"
+}
+
+func postDiscordWebhook(webhookURL string, payload []byte) error {
+	request, errNewRequest := http.NewRequest(http.MethodPost, webhookURL, strings.NewReader(string(payload)))
+	if errNewRequest != nil {
+		return fmt.Errorf("create request: %w", errNewRequest)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := http.Client{Timeout: 10 * time.Second}
+	response, errDo := client.Do(request)
+	if errDo != nil {
+		return fmt.Errorf("send request: %w", errDo)
+	}
+	response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("Discord returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func currentCodexPoolStats(recentAuthID string) poolStats {
+	if stats, errHost := hostCodexPoolStats(recentAuthID); errHost == nil {
+		return stats
+	} else {
+		slog.Debug("codex-429-autoban: unable to read auth list for Discord pool status", "error", errHost)
+	}
+
+	stats := latestPoolStats.snapshot()
+	if !stats.Known {
+		return stats
+	}
+	if _, candidateSeen := stats.CandidateIDs[strings.TrimSpace(recentAuthID)]; candidateSeen && stats.Available > 0 {
+		stats.Available--
+	}
+	return stats
+}
+
+func hostCodexPoolStats(recentAuthID string) (poolStats, error) {
+	raw, errHost := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+	if errHost != nil {
+		return poolStats{}, errHost
+	}
+	var response hostAuthListResponse
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		return poolStats{}, fmt.Errorf("decode host.auth.list result: %w", errUnmarshal)
+	}
+
+	now := time.Now()
+	stats := poolStats{Known: true, CandidateIDs: make(map[string]struct{})}
+	for _, auth := range response.Files {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), providerCodex) {
+			continue
+		}
+		stats.Total++
+		for _, id := range []string{auth.ID, auth.Name, auth.Path} {
+			if id = strings.TrimSpace(id); id != "" {
+				stats.CandidateIDs[id] = struct{}{}
+			}
+		}
+		if auth.Disabled || auth.Unavailable || strings.EqualFold(auth.Status, "disabled") || strings.EqualFold(auth.Status, "unavailable") {
+			continue
+		}
+		if !auth.NextRetryAfter.IsZero() && now.Before(auth.NextRetryAfter) {
+			continue
+		}
+		if authIDMatches(recentAuthID, auth.ID, auth.Name, auth.Path) || authIsBanned(auth.ID, auth.Name, auth.Path) {
+			continue
+		}
+		stats.Available++
+	}
+	return stats, nil
+}
+
+func authIDMatches(target string, ids ...string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, id := range ids {
+		if target == strings.TrimSpace(id) {
+			return true
+		}
+	}
+	return false
+}
+
+func authIsBanned(ids ...string) bool {
+	now := time.Now()
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		entry, ok := banStore.lookup(strings.TrimSpace(id))
+		if ok && now.Before(entry.ResetAt) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *poolStatsState) set(stats poolStats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats.CandidateIDs == nil {
+		stats.CandidateIDs = make(map[string]struct{})
+	}
+	s.stats = stats
+}
+
+func (s *poolStatsState) snapshot() poolStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stats := s.stats
+	stats.CandidateIDs = make(map[string]struct{}, len(s.stats.CandidateIDs))
+	for id := range s.stats.CandidateIDs {
+		stats.CandidateIDs[id] = struct{}{}
+	}
+	return stats
+}
+
+func callHost(method string, payload any) (json.RawMessage, error) {
+	rawPayload, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal host callback payload %s: %w", method, errMarshal)
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var response C.cliproxy_buffer
+	var requestPtr *C.uint8_t
+	if len(rawPayload) > 0 {
+		cPayload := C.CBytes(rawPayload)
+		if cPayload == nil {
+			return nil, fmt.Errorf("allocate host callback payload %s", method)
+		}
+		defer C.free(cPayload)
+		requestPtr = (*C.uint8_t)(cPayload)
+	}
+	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	var rawResponse []byte
+	if response.ptr != nil && response.len > 0 {
+		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+	}
+	if response.ptr != nil {
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if len(rawResponse) == 0 {
+		return nil, fmt.Errorf("host callback %s returned no response, code=%d", method, int(callCode))
+	}
+
+	var env envelope
+	if errUnmarshal := json.Unmarshal(rawResponse, &env); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode host callback envelope %s: %w", method, errUnmarshal)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("host callback %s failed", method)
+	}
+	if callCode != 0 {
+		return nil, fmt.Errorf("host callback %s returned code=%d", method, int(callCode))
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
 }
 
 // classifyAndBuildBan inspects the upstream x-codex-* response headers and
@@ -438,19 +812,31 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 
 	now := time.Now()
 	available := make([]pluginapi.SchedulerAuthCandidate, 0, len(req.Candidates))
+	codexTotal := 0
+	codexAvailable := 0
+	candidateIDs := make(map[string]struct{})
 	for _, candidate := range req.Candidates {
 		// Only Codex credentials are subject to our bans.
 		if !strings.EqualFold(candidate.Provider, providerCodex) {
 			available = append(available, candidate)
 			continue
 		}
+		codexTotal++
+		candidateIDs[candidate.ID] = struct{}{}
 		// clearIfExpired auto-re-enables credentials whose reset time passed.
 		if banStore.clearIfExpired(candidate.ID, now) {
 			// Still banned: drop from the candidate list.
 			continue
 		}
+		codexAvailable++
 		available = append(available, candidate)
 	}
+	latestPoolStats.set(poolStats{
+		Available:    codexAvailable,
+		Total:        codexTotal,
+		Known:        true,
+		CandidateIDs: candidateIDs,
+	})
 
 	// If every Codex candidate is banned (and there were no non-Codex ones),
 	// decline to handle so CPA's own logic can decide (e.g. wait on its
@@ -514,6 +900,11 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 				Path:        managementRoutePrefix + "/unban-all",
 				Description: "Remove every Codex auth from the in-memory ban list.",
 			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementRoutePrefix + "/test-webhook",
+				Description: "Send a test notification to the configured Discord webhook.",
+			},
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
@@ -546,6 +937,8 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return handleManagementUnban(req)
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban-all"):
 		return handleManagementUnbanAll()
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/test-webhook"):
+		return handleManagementTestWebhook()
 	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
 		return htmlManagementResponse(http.StatusOK, managementStatusPage())
 	default:
@@ -666,6 +1059,52 @@ func handleManagementUnbanAll() pluginapi.ManagementResponse {
 	})
 }
 
+func handleManagementTestWebhook() pluginapi.ManagementResponse {
+	cfg := configuredPlugin()
+	if cfg.DiscordWebhookURL == "" {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+			"error":   "discord_webhook_not_configured",
+			"message": "configure discord_webhook_url before testing the webhook",
+		})
+	}
+
+	stats := currentCodexPoolStats("")
+	poolText := "未知"
+	if stats.Known {
+		poolText = fmt.Sprintf("%d / %d", stats.Available, stats.Total)
+	}
+	payload := discordWebhookPayload{
+		Username: discordWebhookTitle,
+		Embeds: []discordEmbed{{
+			Title:     "Discord Webhook 测试成功",
+			Color:     5763719,
+			Fields:    []discordField{{Name: "Codex 号池可用 / 总数", Value: poolText, Inline: true}},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Footer:    discordFooter{Text: pluginName + " v" + pluginVersion},
+		}},
+	}
+	raw, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return jsonManagementResponse(http.StatusInternalServerError, map[string]any{
+			"error":   "encode_webhook_payload_failed",
+			"message": errMarshal.Error(),
+		})
+	}
+	if errPost := postDiscordWebhook(cfg.DiscordWebhookURL, raw); errPost != nil {
+		return jsonManagementResponse(http.StatusBadGateway, map[string]any{
+			"error":   "discord_webhook_failed",
+			"message": errPost.Error(),
+		})
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{
+		"ok":             true,
+		"message":        "Discord webhook test sent",
+		"pool_available": stats.Available,
+		"pool_total":     stats.Total,
+		"pool_known":     stats.Known,
+	})
+}
+
 func matchesManagementPath(path, suffix string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
 	if path == "" {
@@ -752,6 +1191,7 @@ func managementStatusPage() string {
     <input id="key" type="password" autocomplete="current-password" placeholder="Management key">
     <div>
       <button class="primary" onclick="refresh()">刷新当前 ban 列表</button>
+      <button onclick="testWebhook()">测试 Discord Webhook</button>
       <button class="danger" onclick="unbanAll()">全部加回号池</button>
     </div>
     <p id="message" class="muted"></p>
@@ -766,7 +1206,8 @@ func managementStatusPage() string {
     <h2>API</h2>
     <pre>GET  /v0/management/plugins/codex-429-autoban/bans
 POST /v0/management/plugins/codex-429-autoban/unban      {"auth_id":"..."}
-POST /v0/management/plugins/codex-429-autoban/unban-all</pre>
+POST /v0/management/plugins/codex-429-autoban/unban-all
+POST /v0/management/plugins/codex-429-autoban/test-webhook</pre>
   </div>
 
   <script>
@@ -839,6 +1280,17 @@ POST /v0/management/plugins/codex-429-autoban/unban-all</pre>
         const data = await call("/bans");
         render(data);
         setMessage("已刷新，共 " + data.count + " 个账号被排除。");
+      } catch (err) {
+        setMessage(err.message, true);
+      }
+    }
+
+    async function testWebhook() {
+      try {
+        setMessage("正在发送 Discord 测试消息...");
+        const data = await call("/test-webhook", {method: "POST", body: "{}"});
+        const pool = data.pool_known ? (data.pool_available + " / " + data.pool_total) : "未知";
+        setMessage("Discord 测试消息已发送；当前 Codex 号池可用/总数：" + pool + "。", false);
       } catch (err) {
         setMessage(err.message, true);
       }

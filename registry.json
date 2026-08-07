@@ -4,9 +4,9 @@
     {
       "id": "codex-429-autoban",
       "name": "Codex 429 Autoban",
-      "description": "Auto-disable Codex credentials after 429 and manually re-enable them after quota reset.",
+      "description": "Auto-disable Codex credentials after 429, re-enable them after quota reset, and notify Discord with Codex pool availability.",
       "author": "wds824",
-      "version": "0.2.3",
+      "version": "0.3.0",
       "repository": "https://github.com/wds824/codex-429-autoban",
       "homepage": "https://github.com/wds824/codex-429-autoban",
       "license": "MIT",
@@ -14,7 +14,9 @@
         "codex",
         "scheduler",
         "usage",
-        "management"
+        "management",
+        "discord",
+        "webhook"
       ]
     }
   ]

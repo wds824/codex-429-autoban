@@ -12,7 +12,8 @@
    - 两个都满 → 按较晚的（周）解禁
 3. **自动解禁**：之后每次 CPA 选凭证时，插件把"还没到解禁时间"的凭证从候选里剔除；一旦过了刷新时间，自动放回候选。
 4. **手动加回号池**：如果你在 Codex 侧手动重置额度或使用了重置卡，可以通过插件的 Management API / 资源页立即解除插件内存里的 ban，不必等原来的 `reset-at`。
-5. **只管 codex**：非 codex 凭证一律不干预，交给 CPA 原有逻辑。
+5. **Discord 通知**：配置 Discord Incoming Webhook 后，新账号因 429 被排除时会发送账号、窗口、解除时间和 Codex 号池可用/总数。
+6. **只管 codex**：非 codex 凭证一律不干预，交给 CPA 原有逻辑。
 
 ## 怎么判断 5 小时还是周限额
 
@@ -95,7 +96,18 @@ plugins:
     codex-429-autoban:
       enabled: true
       priority: 100   # 数字越大越先执行；建议设高一点，让禁用判断先于其他调度插件
+      discord_webhook_url: "https://discord.com/api/webhooks/<id>/<token>"
+      discord_notify_429: true
+      discord_notify_pool: true
 ```
+
+配置说明：
+
+- `discord_webhook_url`：Discord 频道的 Incoming Webhook URL；留空则关闭通知。
+- `discord_notify_429`：是否发送新 429 排除通知，默认 `true`。同一个账号在同一段 ban 期间重复 429 不会重复刷屏。
+- `discord_notify_pool`：是否在通知中附带“可用 / 总数”号池统计，默认 `true`。
+
+Discord 统计优先读取 CPA 当前 Codex auth 列表，并排除 CPA 已禁用、不可用以及本插件 ban 中的账号；如果主机不支持 auth 列表回调，则使用最近一次调度候选统计。
 
 > 如果你的 CPA 二进制不支持插件，响应头里不会有 `httpX-CPA-SUPPORT-PLUGIN: 1`。需要用 CGO 编译版的 CPA。
 
@@ -108,6 +120,8 @@ CPA 插件没有“Codex 已手动重置额度”的事件回调，所以插件�
 ```text
 /v0/resource/plugins/codex-429-autoban/status
 ```
+
+资源页中的“测试 Discord Webhook”按钮会立即发送一条测试消息，并显示当前 Codex 号池可用/总数。
 
 API（需要 CPA 管理密钥，支持 `Authorization: Bearer <key>` 或 `X-Management-Key`）：
 
@@ -125,6 +139,10 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
 # 清空全部插件 ban 状态
 curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   http://localhost:8317/v0/management/plugins/codex-429-autoban/unban-all
+
+# 测试 Discord Webhook
+curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  http://localhost:8317/v0/management/plugins/codex-429-autoban/test-webhook
 ```
 
 注意：这里清除的是本插件的**内存 ban 状态**。请只在你确认 Codex 侧额度已经恢复（例如手动重置额度/使用重置卡）后使用，否则账号可能马上再次 429 并被重新 ban。
@@ -138,6 +156,9 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   └─ 是 codex 且 429
         ├─ 读 x-codex-* 头，判断 5h、周限额还是月限额
         └─ 记录：该凭证"到 X 时间才能再用"
+
+429 处理完成 → Discord Webhook
+  └─ 账号 + 窗口 + reset-at + Codex 可用/总数
 
 下次有请求来选凭证 → scheduler.pick（插件介入）
   ├─ 剔除"还没到解禁时间"的 codex 凭证
@@ -155,7 +176,7 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
 
 | 文件 | 作用 |
 |---|---|
-| `main.go` | 插件主代码（usage.handle 检测 + scheduler.pick 过滤 + Management API 手动解禁） |
+| `main.go` | 插件主代码（429 检测、窗口解禁、调度过滤、Discord 通知、Management API） |
 | `cpasdk/pluginabi/` | CPA 插件 ABI 常量（本地化，免 Go 1.26） |
 | `cpasdk/pluginapi/` | CPA 插件类型定义（本地化） |
 | `build.ps1` / `build.sh` | 编译脚本 |
