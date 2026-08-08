@@ -93,7 +93,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.3.2"
+	pluginVersion = "0.3.3"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -987,6 +987,11 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 			},
 			{
 				Method:      http.MethodPost,
+				Path:        managementRoutePrefix + "/reset-ban",
+				Description: "Re-apply one Codex auth ban until the effective reset time shown by the status page. Body: {\"auth_id\":\"...\"}.",
+			},
+			{
+				Method:      http.MethodPost,
 				Path:        managementRoutePrefix + "/unban-all",
 				Description: "Remove every Codex auth from the in-memory ban list.",
 			},
@@ -1025,6 +1030,8 @@ func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 		return jsonManagementResponse(http.StatusOK, currentBanStatus())
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban"):
 		return handleManagementUnban(req)
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/reset-ban"):
+		return handleManagementResetBan(req)
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban-all"):
 		return handleManagementUnbanAll()
 	case method == http.MethodPost && matchesManagementPath(req.Path, "/test-webhook"):
@@ -1154,6 +1161,10 @@ type managementUnbanRequest struct {
 	All    bool   `json:"all"`
 }
 
+type managementResetBanRequest struct {
+	AuthID string `json:"auth_id"`
+}
+
 func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body managementUnbanRequest
 	if len(req.Body) > 0 {
@@ -1189,6 +1200,90 @@ func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.Management
 		"auth_id": authID,
 		"removed": removed,
 		"status":  currentBanStatus(),
+	})
+}
+
+func handleManagementResetBan(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body managementResetBanRequest
+	if len(req.Body) > 0 {
+		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
+			return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+				"error":   "invalid_json",
+				"message": errUnmarshal.Error(),
+			})
+		}
+	}
+
+	authID := strings.TrimSpace(body.AuthID)
+	if authID == "" {
+		authID = strings.TrimSpace(req.Query.Get("auth_id"))
+	}
+	if authID == "" {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+			"error":   "missing_auth_id",
+			"message": "provide auth_id in JSON body or query string",
+		})
+	}
+
+	now := time.Now()
+	if !banStore.clearIfExpired(authID, now) {
+		if _, exists := banStore.lookup(authID); !exists {
+			return jsonManagementResponse(http.StatusNotFound, map[string]any{
+				"error":   "ban_not_found",
+				"message": "auth is not currently in the plugin ban list",
+				"auth_id": authID,
+			})
+		}
+	}
+
+	entry, exists := banStore.lookup(authID)
+	if !exists {
+		return jsonManagementResponse(http.StatusNotFound, map[string]any{
+			"error":   "ban_not_found",
+			"message": "auth is not currently in the plugin ban list",
+			"auth_id": authID,
+		})
+	}
+
+	// Use the same effective reset time shown by the status page: the later
+	// of the plugin reset and CPA's next_retry_after, when CPA exposes one.
+	effectiveResetAt := entry.ResetAt
+	effectiveResetSource := "plugin"
+	if entries, errHost := hostAuthEntries(); errHost == nil {
+		if cpaAuth, cpaFound := findHostAuthEntry(entries, authID); cpaFound && !cpaAuth.NextRetryAfter.IsZero() && cpaAuth.NextRetryAfter.After(effectiveResetAt) {
+			effectiveResetAt = cpaAuth.NextRetryAfter
+			effectiveResetSource = "cpa"
+		}
+	}
+	if effectiveResetAt.IsZero() || !now.Before(effectiveResetAt) {
+		return jsonManagementResponse(http.StatusConflict, map[string]any{
+			"error":   "reset_time_expired",
+			"message": "the recorded reset time has already passed; wait for a new 429 or use a fresh ban record",
+			"auth_id": authID,
+		})
+	}
+
+	window := entry.Window
+	if !strings.HasPrefix(window, "manual reset") {
+		window = "manual reset (" + window + ")"
+	}
+	entry.ResetAt = effectiveResetAt
+	entry.Window = window
+	entry.BannedAt = now
+	banStore.set(authID, entry)
+	slog.Info("codex-429-autoban: manually reset credential ban",
+		"auth_id", authID,
+		"window", entry.Window,
+		"reset_at", effectiveResetAt.Format(time.RFC3339),
+		"reset_source", effectiveResetSource)
+
+	return jsonManagementResponse(http.StatusOK, map[string]any{
+		"ok":                     true,
+		"auth_id":                authID,
+		"reset_at":               effectiveResetAt.Format(time.RFC3339),
+		"reset_at_unix":          effectiveResetAt.Unix(),
+		"effective_reset_source": effectiveResetSource,
+		"status":                 currentBanStatus(),
 	})
 }
 
@@ -1334,10 +1429,10 @@ func managementStatusPage() string {
 </head>
 <body>
   <h1>codex-429-autoban</h1>
-  <p class="muted">版本 ` + version + ` · 手动把已重置额度的 Codex 账号加回号池。</p>
+  <p class="muted">版本 ` + version + ` · 按真实 reset time 管理 Codex 账号的 ban。</p>
 
   <div class="card">
-    <p>资源页本身不带管理鉴权。要执行查看/解除操作，请填入 CPA 管理密钥；请求会使用 <code>Authorization: Bearer &lt;key&gt;</code>。</p>
+    <p>资源页本身不带管理鉴权。要执行查看、重设 ban 或解除操作，请填入 CPA 管理密钥；请求会使用 <code>Authorization: Bearer &lt;key&gt;</code>。</p>
     <label for="key">CPA 管理密钥</label>
     <input id="key" type="password" autocomplete="current-password" placeholder="Management key">
     <div>
@@ -1350,6 +1445,7 @@ func managementStatusPage() string {
 
   <div class="card">
     <h2>当前被插件排除的账号</h2>
+    <p class="muted">“重新设置 ban”会按当前页面的“预计实际回池时间”重新写入插件内存，不会修改 Codex 侧额度。</p>
     <div id="list">尚未加载。</div>
   </div>
 
@@ -1357,6 +1453,7 @@ func managementStatusPage() string {
     <h2>API</h2>
     <pre>GET  /v0/management/plugins/codex-429-autoban/bans
 POST /v0/management/plugins/codex-429-autoban/unban      {"auth_id":"..."}
+POST /v0/management/plugins/codex-429-autoban/reset-ban  {"auth_id":"..."}
 POST /v0/management/plugins/codex-429-autoban/unban-all
 POST /v0/management/plugins/codex-429-autoban/test-webhook</pre>
   </div>
@@ -1444,7 +1541,7 @@ POST /v0/management/plugins/codex-429-autoban/test-webhook</pre>
       for (const ban of data.bans) {
         const cpaStatus = ban.cpa_status_message || ban.cpa_status || "";
         const cpaStatusTitle = cpaStatus ? " title=\"" + escapeHtml(cpaStatus) + "\"" : "";
-        html += "<tr><td><code>" + escapeHtml(ban.auth_id) + "</code></td><td>" + escapeHtml(ban.window) + "</td><td>" + escapeHtml(ban.reset_at) + "</td><td" + cpaStatusTitle + ">" + formatCpaRetryAt(ban) + "</td><td>" + formatEffectiveResetAt(ban) + "</td><td>" + formatEffectiveRemaining(ban) + "</td><td><button onclick=\"unban('" + escapeJs(ban.auth_id) + "')\">加回号池</button></td></tr>";
+       html += "<tr><td><code>" + escapeHtml(ban.auth_id) + "</code></td><td>" + escapeHtml(ban.window) + "</td><td>" + escapeHtml(ban.reset_at) + "</td><td" + cpaStatusTitle + ">" + formatCpaRetryAt(ban) + "</td><td>" + formatEffectiveResetAt(ban) + "</td><td>" + formatEffectiveRemaining(ban) + "</td><td><button onclick=\"resetBan('" + escapeJs(ban.auth_id) + "','" + escapeJs(ban.effective_reset_at) + "')\">重新设置 ban</button><button onclick=\"unban('" + escapeJs(ban.auth_id) + "')\">加回号池</button></td></tr>";
       }
       html += "</tbody></table>";
       list.innerHTML = html;
@@ -1477,6 +1574,17 @@ POST /v0/management/plugins/codex-429-autoban/test-webhook</pre>
         const data = await call("/test-webhook", {method: "POST", body: "{}"});
         const pool = data.pool_known ? (data.pool_available + " / " + data.pool_total) : "未知";
         setMessage("Discord 测试消息已发送；当前 Codex 号池可用/总数：" + pool + "。", false);
+      } catch (err) {
+        setMessage(err.message, true);
+      }
+    }
+
+    async function resetBan(authID, effectiveResetAt) {
+      if (!confirm("确认按照预计实际回池时间重新设置 " + authID + " 的 ban？\n解禁时间：" + effectiveResetAt)) return;
+      try {
+        const data = await call("/reset-ban", {method: "POST", body: JSON.stringify({auth_id: authID})});
+        render(data.status);
+        setMessage("已重新设置 ban：" + authID + "；解禁时间：" + data.reset_at);
       } catch (err) {
         setMessage(err.message, true);
       }

@@ -126,7 +126,7 @@ Discord 统计优先读取 CPA 当前 Codex auth 列表，并排除 CPA 已禁�
 
 ## 手动加回号池（Codex 重置额度/重置卡后）
 
-CPA 插件没有“Codex 已手动重置额度”的事件回调，所以插件无法可靠自动感知你在 Codex 侧用了重置卡。为了解决这个问题，插件提供了 Management API 和一个资源页来**手动解除 ban**。
+CPA 插件没有“Codex 已手动重置额度”的事件回调，所以插件无法可靠自动感知你在 Codex 侧用了重置卡。为了解决这个问题，插件提供了 Management API 和一个资源页来**手动解除 ban**，或按照当前真实的预计回池时间**重新设置 ban**。
 
 资源页（在 CPA 管理界面的插件菜单里也会出现）：
 
@@ -149,6 +149,12 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   -d '{"auth_id":"<AUTH_ID>"}' \
   http://localhost:8317/v0/management/plugins/codex-429-autoban/unban
 
+# 按当前“预计实际回池时间”重新设置单个账号的 ban
+curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"auth_id":"<AUTH_ID>"}' \
+  http://localhost:8317/v0/management/plugins/codex-429-autoban/reset-ban
+
 # 清空全部插件 ban 状态
 curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   http://localhost:8317/v0/management/plugins/codex-429-autoban/unban-all
@@ -158,7 +164,7 @@ curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
   http://localhost:8317/v0/management/plugins/codex-429-autoban/test-webhook
 ```
 
-注意：这里清除的是本插件的**内存 ban 状态**。请只在你确认 Codex 侧额度已经恢复（例如手动重置额度/使用重置卡）后使用，否则账号可能马上再次 429 并被重新 ban。
+注意：这里修改的是本插件的**内存 ban 状态**，不会修改 Codex 侧额度。重新设置 ban 时，插件使用页面显示的“预计实际回池时间”（插件 `reset-at` 与 CPA `next_retry_after` 中较晚者）。
 
 ## 工作流程图
 
